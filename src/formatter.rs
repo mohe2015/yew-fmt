@@ -663,6 +663,9 @@ impl<'fmt, 'src: 'fmt> Visit<'_> for FmtCtx<'fmt, 'src> {
             let Some(name) = i.path.segments.last() else {
                 return Ok(None);
             };
+            if i.path.segments.len() != 1 {
+                return Ok(None);
+            }
             if name.ident != "html" && name.ident != "html_nested" {
                 return Ok(None);
             }
