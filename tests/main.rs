@@ -34,6 +34,11 @@ fn for_block() {
 }
 
 #[test]
+fn hard_tabs() {
+    cmp("tests/samples/hard_tabs")
+}
+
+#[test]
 fn html_for() {
     cmp("tests/samples/html_for")
 }
@@ -89,6 +94,21 @@ fn issue_2() {
 }
 
 #[test]
+fn issue_21() {
+    cmp("tests/samples/issue_21")
+}
+
+#[test]
+fn issue_22() {
+    cmp("tests/samples/issue_22")
+}
+
+#[test]
+fn issue_24() {
+    cmp("tests/samples/issue_24")
+}
+
+#[test]
 fn issue_3() {
     cmp("tests/samples/issue_3")
 }
@@ -116,6 +136,11 @@ fn issue_8() {
 #[test]
 fn issue_9() {
     cmp("tests/samples/issue_9")
+}
+
+#[test]
+fn long_css() {
+    cmp("tests/samples/long_css")
 }
 
 #[test]

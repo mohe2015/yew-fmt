@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::css::parse_css;
 use crate::utils::{default, Result, SliceExt, StrExt};
 use anyhow::{bail, Context};
 use bumpalo::collections::Vec;
@@ -9,6 +10,7 @@ use codespan_reporting::term;
 use codespan_reporting::term::termcolor::WriteColor;
 use proc_macro2::LineColumn;
 use std::mem::{replace, take};
+use std::ops::BitOr;
 use std::vec::Vec as StdVec;
 use syn::punctuated::Punctuated;
 use syn::{spanned::Spanned, visit::Visit, Macro};
@@ -16,19 +18,6 @@ use syn::{Attribute, Item, MacroDelimiter, Stmt};
 
 fn is_skipped(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|attr| attr.path().segments.iter().map(|x| &x.ident).eq(["rustfmt", "skip"]))
-}
-
-fn print_break(out: &mut String, n_newlines: u8, indent: usize) {
-    if n_newlines == 0 {
-        return;
-    }
-    out.reserve(indent + 1);
-    for _ in 0..n_newlines {
-        out.push('\n')
-    }
-    for _ in 0..indent {
-        out.push(' ')
-    }
 }
 
 /// if `new` is 1 line, returns its length added to `prev`, otherwise returns the length of the
@@ -108,10 +97,30 @@ impl<'src> Iterator for CommentParser<'src> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Location {
     pub start: LineColumn,
     pub end: LineColumn,
+}
+
+impl Location {
+    pub fn zero_width(point: LineColumn) -> Self {
+        Self { start: point, end: point }
+    }
+
+    pub fn find_saturating(osnova: shrimple_parser::Location, igla: &str, stog: &str) -> Location {
+        Self {
+            start: osnova
+                .offset(shrimple_parser::Location::find_saturating(igla.as_ptr(), stog))
+                .into(),
+            end: osnova
+                .offset(shrimple_parser::Location::find_saturating(
+                    igla[igla.len()..].as_ptr(),
+                    stog,
+                ))
+                .into(),
+        }
+    }
 }
 
 /// Represents an object that has an associated location in the source
@@ -199,16 +208,28 @@ pub struct Spacing {
     pub after: bool,
 }
 
+impl BitOr for Spacing {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self {
+            before: self.before | rhs.before,
+            between: self.between | rhs.between,
+            after: self.after | rhs.after,
+        }
+    }
+}
+
 impl Spacing {
     pub const AROUND: Self = Self { before: true, between: false, after: true };
 }
 
 /// Chains are sequences of formatting blocks that are all broken if one of them is broken; in a
 /// sequence of formatting blocks, a chain will have the following shape:
-/// `[..., Off, Full, Forward, ..., Full, End, Off, ...]`
+/// `[..., Off, Full, ..., Full, End, Off, ...]`
 /// where the words are the names of the variants of [`ChainingRule`].
 /// A chain starts from a [`ChainingRule::On`] variant but ends with a [`ChainingRule::End`]; this
-/// is done to make the chains declare their end on their own without having to add an addition
+/// is done to make the chains declare their end on their own without having to add an additional
 /// variant to [`FmtToken`], and to also avoid the possibility of 2 unrelated chains getting
 /// misinterpreted as 1.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -271,7 +292,7 @@ impl<'fmt, 'src> FmtBlock<'fmt, 'src> {
     }
 
     fn add_raw_sep(&mut self, n_newlines: u8) {
-        self.width += self.spacing.map_or(false, |s| s.between) as usize;
+        self.width += self.spacing.is_some_and(|s| s.between) as usize;
         self.tokens.push(FmtToken::Sep(n_newlines))
     }
 
@@ -314,7 +335,7 @@ impl<'fmt, 'src> FmtBlock<'fmt, 'src> {
             }
         }
 
-        if comment_added && self.spacing.map_or(false, |s| s.between) {
+        if comment_added && self.spacing.is_some_and(|s| s.between) {
             sep(self);
         }
         Ok(())
@@ -330,6 +351,9 @@ impl<'fmt, 'src> FmtBlock<'fmt, 'src> {
     }
 
     pub fn add_text(&mut self, ctx: &FmtCtx<'_, 'src>, text: &'src str, at: LineColumn) -> Result {
+        if text.is_empty() {
+            return Ok(());
+        }
         self.add_comments(ctx, at)?;
         self.add_raw_text(text);
         self.cur_offset += text.len();
@@ -378,7 +402,7 @@ impl<'fmt, 'src> FmtBlock<'fmt, 'src> {
         res
     }
 
-    /// same as `add_block` but also:
+    /// same as [`FmtBlock::add_block`] but also:
     /// - adds the delimiters at the provided source locations;
     /// - adds trailing comments before the closing delimiter to the new block
     pub fn add_delimited_block<R>(
@@ -434,15 +458,28 @@ impl<'fmt, 'src> FmtBlock<'fmt, 'src> {
         self.add_source(ctx, loc)
     }
 
-    pub fn add_source_iter(
+    pub fn maybe_add_source(
+        &mut self,
+        ctx: &FmtCtx<'_, 'src>,
+        obj: Option<impl Located>,
+    ) -> Result {
+        if let Some(obj) = obj {
+            self.add_source(ctx, obj)?;
+        }
+        Ok(())
+    }
+
+    pub fn add_source_spanned_by_iter(
         &mut self,
         ctx: &FmtCtx<'_, 'src>,
         iter: impl IntoIterator<Item = impl Located>,
     ) -> Result {
-        for obj in iter {
-            self.add_source(ctx, obj)?;
-        }
-        Ok(())
+        let mut iter = iter.into_iter();
+        let Some(first) = iter.next().map(|x| x.loc()) else {
+            return Ok(());
+        };
+        let last = iter.last().map_or(first, |x| x.loc());
+        self.add_source(ctx, Location { start: first.start, end: last.end })
     }
 
     pub fn add_source_punctuated<T, P>(
@@ -457,9 +494,38 @@ impl<'fmt, 'src> FmtBlock<'fmt, 'src> {
         for pair in iter.pairs() {
             let (value, punct) = pair.into_tuple();
             self.add_source(ctx, value)?;
-            self.add_source_iter(ctx, punct)?;
+            self.maybe_add_source(ctx, punct)?;
         }
         Ok(())
+    }
+
+    /// Assuming the block has only 1 token, a nested block, flatten that block & its metadata onto
+    /// `self`
+    pub fn flatten(&mut self) {
+        let token = self.tokens.drain(..).next();
+        debug_assert!(
+            self.tokens.is_empty(),
+            "the block must have only 1 token, the nested block\nextra tokens: {:#?}",
+            self.tokens,
+        );
+        let block = match token {
+            Some(FmtToken::Block(block)) => block,
+            _ if cfg!(debug_assertions) => {
+                unreachable!("the block must have a nested block as its 1st token");
+            }
+            Some(extra) => {
+                self.tokens.insert(0, extra);
+                return;
+            }
+            None => return,
+        };
+
+        self.spacing = match (self.spacing, block.spacing) {
+            (None, None) => None,
+            (None, Some(x)) | (Some(x), None) => Some(x),
+            (Some(x), Some(y)) => Some(x | y),
+        };
+        self.tokens = block.tokens;
     }
 
     fn force_breaking(&mut self, ctx: &FmtCtx<'_, 'src>, indent: usize) {
@@ -556,7 +622,7 @@ impl<'fmt, 'src> FmtBlock<'fmt, 'src> {
                 if let Sep::Newline = sep {
                     out.push_str("//");
                     out.push_str(comment);
-                    print_break(out, 1, indent)
+                    cfg.print_break(out, 1, indent)
                 } else {
                     out.push_str("/*");
                     out.push_str(comment);
@@ -566,13 +632,13 @@ impl<'fmt, 'src> FmtBlock<'fmt, 'src> {
             FmtToken::Sep(n_newlines) => match sep {
                 Sep::None => (),
                 Sep::Space => out.push(' '),
-                Sep::Newline => print_break(out, *n_newlines, indent),
+                Sep::Newline => cfg.print_break(out, *n_newlines, indent),
             },
             FmtToken::Block(block) => block.print(indent, cfg, out),
         };
 
         if self.tokens.is_empty() {
-            if self.spacing.map_or(false, |s| s.before && s.after) {
+            if self.spacing.is_some_and(|s| s.before && s.after) {
                 out.push(' ');
             }
         } else if let Some(spacing) = self.spacing {
@@ -587,14 +653,15 @@ impl<'fmt, 'src> FmtBlock<'fmt, 'src> {
             }
         } else {
             let new_indent = indent + cfg.tab_spaces;
-            print_break(out, 1, new_indent);
+            cfg.print_break(out, 1, new_indent);
             for token in &self.tokens {
                 print_token(token, out, new_indent, Sep::Newline);
             }
             if let Some(FmtToken::LineComment(_)) = self.tokens.last() {
-                out.truncate(out.len() - 4)
+                let extra_span = if cfg.hard_tabs { 1 } else { cfg.tab_spaces };
+                out.truncate(out.len() - extra_span);
             } else {
-                print_break(out, 1, indent)
+                cfg.print_break(out, 1, indent);
             }
         }
     }
@@ -690,7 +757,7 @@ impl<'fmt, 'src: 'fmt> Visit<'_> for FmtCtx<'fmt, 'src> {
                     self.pos_to_byte_offset(html_start)?,
                 );
 
-                let html = match self.config.yew.html_flavor.parse_root(i.tokens.clone()) {
+                let mut html = match self.config.yew.html_flavor.parse_root(i.tokens.clone()) {
                     Ok(html) => html,
                     Err(e) => {
                         let span = e.span();
@@ -703,6 +770,7 @@ impl<'fmt, 'src: 'fmt> Visit<'_> for FmtCtx<'fmt, 'src> {
                         ));
                     }
                 };
+                parse_css(&mut html, self.config)?;
                 html.format(&mut block, self)?;
 
                 self.print_fmt_block(block, html_end)?;
@@ -783,9 +851,9 @@ impl<'fmt, 'src> FmtCtx<'fmt, 'src> {
             .get(line - 1)
             .with_context(|| format!("line {line} doesn't exist in the source file"))?;
         let line = unsafe { self.input.get_unchecked(start..) };
-        for (i, ch) in line.char_indices() {
+        for (off, ch) in line.char_visual_offsets(self.config.tab_spaces) {
             match ch {
-                ' ' => {
+                ' ' | '\t' => {
                     state = match state {
                         State::Space => continue,
                         State::CommentStart => State::Space,
@@ -811,8 +879,8 @@ impl<'fmt, 'src> FmtCtx<'fmt, 'src> {
                 }
                 '\n' => bail!("line {line} of the source file is empty"),
                 _ => match state {
-                    State::Space => return Ok(i),
-                    State::CommentStart => return Ok(i - 1),
+                    State::Space => return Ok(off),
+                    State::CommentStart => return Ok(off - 1),
                     State::Comment => continue,
                     State::CommentEnd => continue,
                 },
@@ -846,7 +914,6 @@ impl<'fmt, 'src> FmtCtx<'fmt, 'src> {
     fn print_fmt_block(&mut self, mut block: FmtBlock<'fmt, 'src>, end: LineColumn) -> Result {
         let indent = self.line_indent(self.cur_pos.line)?;
         block.determine_breaking(self, self.cur_pos.column - indent, indent);
-        //panic!("{block:#?}");
         block.print(indent, self.config, self.output);
         self.cur_pos = end;
         let off = self.pos_to_byte_offset(end)?;

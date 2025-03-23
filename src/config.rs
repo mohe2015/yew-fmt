@@ -8,6 +8,7 @@ use std::{
 
 #[derive(Clone)]
 pub struct Config {
+    pub hard_tabs: bool,
     pub tab_spaces: usize,
     pub yew: YewConfig,
 }
@@ -19,16 +20,20 @@ pub struct YewConfig {
     pub unwrap_literal_prop_values: bool,
     pub use_prop_init_shorthand: bool,
     pub self_close_elements: bool,
+    pub format_css: bool,
     pub html_flavor: HtmlFlavor,
     pub unknown: HashMap<String, IgnoredAny>,
 }
 
 #[derive(Deserialize)]
 struct RawConfig {
-    tab_spaces: Option<usize>,
     max_width: Option<usize>,
     use_field_init_shorthand: Option<bool>,
     use_small_heuristics: Option<UseSmallHeuristics>,
+    // The fields above are only needed as default values for the respective `yew.` values,
+    // so they don't remain in the parsed `Config`
+    hard_tabs: Option<bool>,
+    tab_spaces: Option<usize>,
     #[serde(default)]
     yew: RawConfigYew,
 }
@@ -40,6 +45,7 @@ struct RawConfigYew {
     use_small_heuristics: Option<UseSmallHeuristics>,
     use_prop_init_shorthand: Option<bool>,
     self_close_elements: Option<bool>,
+    format_css: Option<bool>,
     html_flavor: Option<HtmlFlavor>,
     #[serde(flatten)]
     unknown: HashMap<String, IgnoredAny>,
@@ -133,6 +139,7 @@ impl Config {
         let mut raw: RawConfig = basic_toml::from_str(src)?;
         for (key, value) in ext {
             parse_field!(key.as_ref(), value.as_ref(), raw.{
+                hard_tabs: bool,
                 tab_spaces: usize,
                 max_width: usize,
                 use_field_init_shorthand: bool,
@@ -142,11 +149,14 @@ impl Config {
                 yew.unwrap_literal_prop_values: bool,
                 yew.use_prop_init_shorthand: bool,
                 yew.self_close_elements: bool,
+                yew.format_css: bool,
                 yew.html_flavor: HtmlFlavor
             });
         }
 
         Ok(Self {
+            hard_tabs: raw.hard_tabs
+                .unwrap_or(false),
             tab_spaces: raw.tab_spaces
                 .unwrap_or(4),
             yew: YewConfig {
@@ -162,6 +172,8 @@ impl Config {
                     .or(raw.use_field_init_shorthand)
                     .unwrap_or(false),
                 self_close_elements: raw.yew.self_close_elements
+                    .unwrap_or(true),
+                format_css: raw.yew.format_css
                     .unwrap_or(true),
                 html_flavor: raw.yew.html_flavor
                     .unwrap_or(HtmlFlavor::Base),
@@ -228,5 +240,43 @@ impl Config {
         return_parsed_if_file_exists!(&global);
 
         Self::parse("", additional)
+    }
+
+    pub fn print_break(&self, out: &mut String, n_newlines: u8, mut indent: usize) {
+        if n_newlines == 0 {
+            return;
+        }
+        out.reserve(indent + 1);
+        for _ in 0..n_newlines {
+            out.push('\n')
+        }
+
+        if self.hard_tabs {
+            let n_tabs = indent / self.tab_spaces;
+            for _ in 0..n_tabs {
+                out.push('\t');
+            }
+            indent %= self.tab_spaces;
+        }
+
+        for _ in 0..indent {
+            out.push(' ');
+        }
+    }
+
+    pub fn is_inline_css_attr(&self, element: &str, attr: &str) -> bool {
+        match element {
+            "a" | "abbr" | "article" | "aside" | "audio" | "b" | "blockquote" | "br" | "button"
+            | "canvas" | "caption" | "cite" | "code" | "col" | "colgroup" | "details" | "div"
+            | "dl" | "dt" | "dd" | "em" | "figcaption" | "figure" | "fieldset" | "footer"
+            | "form" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "header" | "hr" | "i"
+            | "iframe" | "img" | "input" | "label" | "legend" | "li" | "main" | "mark"
+            | "meter" | "nav" | "ol" | "option" | "p" | "pre" | "progress" | "section"
+            | "select" | "small" | "span" | "strong" | "sub" | "summary" | "sup" | "table"
+            | "tbody" | "td" | "textarea" | "tfoot" | "th" | "thead" | "time" | "tr" | "u"
+            | "ul" | "video" => attr == "style",
+
+            _ => false,
+        }
     }
 }

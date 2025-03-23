@@ -6,7 +6,7 @@ use std::{
     io::{self, Read, Seek, Write},
     ops::Deref,
     path::Path,
-    str::FromStr,
+    str::{CharIndices, FromStr},
 };
 use syn::{
     buffer::Cursor,
@@ -21,6 +21,9 @@ pub trait StrExt {
     fn last_line_len(&self) -> Option<usize>;
     /// Unchecked version of `split_at`, caller must ensure that `self.is_char_boundary(mid)`
     unsafe fn split_at_unchecked(&self, mid: usize) -> (&str, &str);
+    /// Like [`str::char_indices`], but treats a tab as being `tab_spaces` units long, reflecting
+    /// its assumed visual representation.
+    fn char_visual_offsets(&self, tab_spaces: usize) -> impl Iterator<Item = (usize, char)>;
 }
 
 impl StrExt for str {
@@ -30,6 +33,32 @@ impl StrExt for str {
 
     unsafe fn split_at_unchecked(&self, mid: usize) -> (&str, &str) {
         (self.get_unchecked(..mid), self.get_unchecked(mid..))
+    }
+
+    fn char_visual_offsets(&self, tab_spaces: usize) -> impl Iterator<Item = (usize, char)> {
+        struct I<'src> {
+            inner: CharIndices<'src>,
+            /// 1 less than the supplied value
+            tab_additional_length: usize,
+            offset: usize,
+        }
+
+        impl Iterator for I<'_> {
+            type Item = (usize, char);
+
+            fn next(&mut self) -> Option<Self::Item> {
+                let (off, ch) = self.inner.next()?;
+                let off = off + self.offset;
+
+                if ch == '\t' {
+                    self.offset += self.tab_additional_length;
+                }
+
+                Some((off, ch))
+            }
+        }
+
+        I { inner: self.char_indices(), tab_additional_length: tab_spaces - 1, offset: 0 }
     }
 }
 
@@ -139,7 +168,7 @@ impl TokenTreeExt for TokenTree {
 }
 
 /// Overrides `Ident`'s default `Parse` behaviour by accepting Rust keywords
-pub struct AnyIdent(Ident);
+pub struct AnyIdent(pub Ident);
 
 impl Parse for AnyIdent {
     fn parse(input: ParseStream) -> syn::Result<Self> {
@@ -159,6 +188,7 @@ impl Deref for AnyIdent {
         &self.0
     }
 }
+
 /// like `std::fs::write`, but will also create a `.bk` file
 pub fn write_with_backup(filename: &str, new_text: impl AsRef<[u8]>) -> Result {
     let new_text = new_text.as_ref();

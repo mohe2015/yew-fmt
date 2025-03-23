@@ -1,25 +1,26 @@
-use crate::{
-    config::UseSmallHeuristics,
-    formatter::{ChainingRule, FmtBlock, FmtCtx, Format, Located, Location, Spacing},
-    html::HtmlFlavorSpec,
-    utils::{default, AnyIdent, OptionExt, Result},
+use {
+    crate::{
+        config::UseSmallHeuristics,
+        css::StyleString,
+        formatter::{ChainingRule, FmtBlock, FmtCtx, Format, Located, Location, Spacing},
+        html::HtmlFlavorSpec,
+        utils::{default, AnyIdent, OptionExt, Result},
+    },
+    anyhow::Context,
+    proc_macro2::{Delimiter, LineColumn, TokenStream, TokenTree},
+    quote::ToTokens,
+    std::{iter::from_fn, ops::Not},
+    syn::{
+        braced,
+        buffer::Cursor,
+        parse::{Parse, ParseStream},
+        parse2,
+        punctuated::Punctuated,
+        spanned::Spanned,
+        token::Brace,
+        Block, Expr, Lit, Stmt, Token, Type,
+    },
 };
-use anyhow::Context;
-use proc_macro2::{Delimiter, LineColumn, TokenStream, TokenTree};
-use quote::ToTokens;
-use std::iter::from_fn;
-use syn::{
-    braced,
-    buffer::Cursor,
-    parse::{Parse, ParseStream},
-    parse2,
-    punctuated::Punctuated,
-    spanned::Spanned,
-    token::Brace,
-    Block, Expr, Lit, Stmt, Token, Type,
-};
-
-pub struct BaseHtmlFlavor;
 
 pub fn parse_children<T: Parse>(input: ParseStream) -> syn::Result<Vec<T>> {
     let mut res = vec![];
@@ -28,6 +29,32 @@ pub fn parse_children<T: Parse>(input: ParseStream) -> syn::Result<Vec<T>> {
     }
     Ok(res)
 }
+
+pub fn format_children<'src, F: HtmlFlavorSpec>(
+    block: &mut FmtBlock<'_, 'src>,
+    ctx: &mut FmtCtx<'_, 'src>,
+    opening: impl Located,
+    closing: impl Located,
+    had_props_block: bool,
+    children: &[F::Tree],
+) -> Result {
+    block.add_delimited_block(
+        ctx,
+        opening,
+        closing,
+        F::element_children_spacing(ctx, children),
+        if had_props_block { ChainingRule::End } else { ChainingRule::Off },
+        |block, ctx| {
+            for child in children {
+                child.format(block, ctx)?;
+                block.add_sep(ctx, child.end())?;
+            }
+            Ok(())
+        },
+    )
+}
+
+pub struct BaseHtmlFlavor;
 
 impl HtmlFlavorSpec for BaseHtmlFlavor {
     type Root = Html;
@@ -63,7 +90,7 @@ pub enum HtmlTree {
 
 pub struct HtmlBlock {
     pub brace: Brace,
-    pub content: HtmlBlockContent,
+    pub content: Option<HtmlBlockContent>,
 }
 
 pub enum HtmlBlockContent {
@@ -102,7 +129,7 @@ pub struct HtmlLiteralElement<F: HtmlFlavorSpec> {
     pub lt_token: Token![<],
     pub name: TokenStream,
     pub props: Vec<HtmlProp>,
-    pub prop_base: Option<(Token![..], Expr)>,
+    pub prop_base: Option<Box<(Token![..], Expr)>>,
     pub children: Vec<F::Tree>,
     pub closing_tag: Option<(Token![>], Token![<], TokenStream)>,
     pub div_token: Token![/],
@@ -118,6 +145,7 @@ pub enum HtmlPropKind {
     Shortcut(Brace, Punctuated<AnyIdent, Token![-]>),
     Literal(Punctuated<AnyIdent, Token![-]>, Token![=], Lit),
     Block(Punctuated<AnyIdent, Token![-]>, Token![=], Block),
+    Style(Punctuated<AnyIdent, Token![-]>, Token![=], StyleString),
 }
 
 pub struct HtmlIf<F: HtmlFlavorSpec> {
@@ -167,7 +195,12 @@ impl Parse for HtmlBlock {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let content;
         let brace = braced!(content in input);
-        HtmlBlockContent::parse(&content).map(|content| Self { content, brace })
+        content
+            .is_empty()
+            .not()
+            .then(|| HtmlBlockContent::parse(&content))
+            .transpose()
+            .map(|content| Self { content, brace })
     }
 }
 
@@ -293,7 +326,7 @@ impl<F: HtmlFlavorSpec> Parse for HtmlLiteralElement<F> {
             props.push(input.parse()?)
         }
         let prop_base = if input.peek(Token![..]) {
-            Some((input.parse()?, parse2(prop_base_collector(input).collect())?))
+            Some((input.parse()?, parse2(prop_base_collector(input).collect())?).into())
         } else {
             None
         };
@@ -448,19 +481,13 @@ impl<F: HtmlFlavorSpec> Format for HtmlFragment<F> {
             key.format(block, ctx)?;
         }
 
-        block.add_delimited_block(
+        format_children::<F>(
+            block,
             ctx,
             self.gt_token,
             self.closing_lt_token,
-            F::element_children_spacing(ctx, &self.children),
-            ChainingRule::Off,
-            |block, ctx| {
-                for child in &self.children {
-                    child.format(block, ctx)?;
-                    block.add_sep(ctx, child.end())?;
-                }
-                Ok(())
-            },
+            false,
+            &self.children,
         )?;
 
         block.add_source(ctx, self.div_token)?;
@@ -487,20 +514,7 @@ impl<F: HtmlFlavorSpec> Format for HtmlDynamicElement<F> {
         })?;
 
         if let Some((gt, closing_lt, closing_at)) = closing_tag {
-            block.add_delimited_block(
-                ctx,
-                gt,
-                closing_lt,
-                F::element_children_spacing(ctx, &self.children),
-                ChainingRule::End,
-                |block, ctx| {
-                    for child in &self.children {
-                        child.format(block, ctx)?;
-                        block.add_sep(ctx, child.end())?;
-                    }
-                    Ok(())
-                },
-            )?;
+            format_children::<F>(block, ctx, gt, closing_lt, true, &self.children)?;
             block.add_source(ctx, self.div_token)?;
             block.add_source(ctx, closing_at)?;
             block.add_source(ctx, self.closing_gt_token)
@@ -514,7 +528,7 @@ impl<F: HtmlFlavorSpec> Format for HtmlDynamicElement<F> {
 impl<F: HtmlFlavorSpec> Format for HtmlLiteralElement<F> {
     fn format<'src>(&self, block: &mut FmtBlock<'_, 'src>, ctx: &mut FmtCtx<'_, 'src>) -> Result {
         block.add_source(ctx, self.lt_token)?;
-        block.add_source_iter(ctx, self.name.clone())?;
+        block.add_source_spanned_by_iter(ctx, self.name.clone())?;
         let closing_tag = self
             .closing_tag
             .as_ref()
@@ -528,7 +542,7 @@ impl<F: HtmlFlavorSpec> Format for HtmlLiteralElement<F> {
                     prop.format(block, ctx)?;
                     block.add_sep(ctx, prop.end())?;
                 }
-                if let Some((dotdot, prop_base)) = &self.prop_base {
+                if let Some((dotdot, prop_base)) = self.prop_base.as_deref() {
                     block.add_source(ctx, dotdot)?;
                     block.add_source(ctx, prop_base)?;
                     block.add_sep(ctx, prop_base.end())?;
@@ -538,21 +552,9 @@ impl<F: HtmlFlavorSpec> Format for HtmlLiteralElement<F> {
         )?;
 
         if let Some((gt, closing_lt, closing_name)) = closing_tag {
-            block.add_delimited_block(
-                ctx,
-                gt,
-                closing_lt,
-                F::element_children_spacing(ctx, &self.children),
-                ChainingRule::End,
-                |block, ctx| {
-                    Ok(for child in &self.children {
-                        child.format(block, ctx)?;
-                        block.add_sep(ctx, child.end())?;
-                    })
-                },
-            )?;
+            format_children::<F>(block, ctx, gt, closing_lt, true, &self.children)?;
             block.add_source(ctx, self.div_token)?;
-            block.add_source_iter(ctx, closing_name.clone())?;
+            block.add_source_spanned_by_iter(ctx, closing_name.clone())?;
             block.add_source(ctx, self.closing_gt_token)
         } else {
             block.add_source(ctx, self.div_token)?;
@@ -563,18 +565,20 @@ impl<F: HtmlFlavorSpec> Format for HtmlLiteralElement<F> {
 
 impl Format for HtmlProp {
     fn format<'src>(&self, block: &mut FmtBlock<'_, 'src>, ctx: &mut FmtCtx<'_, 'src>) -> Result {
-        block.add_source_iter(ctx, self.access_spec)?;
+        block.maybe_add_source(ctx, self.access_spec)?;
         match &self.kind {
             HtmlPropKind::Shortcut(brace, name) => {
                 block.add_source(ctx, brace.span.open())?;
                 block.add_source_punctuated(ctx, name)?;
                 block.add_source(ctx, brace.span.close())
             }
+
             HtmlPropKind::Literal(name, eq, lit) => {
                 block.add_source_punctuated(ctx, name)?;
                 block.add_source(ctx, eq)?;
                 block.add_source(ctx, lit)
             }
+
             HtmlPropKind::Block(name, eq, expr) => match &*expr.stmts {
                 [Stmt::Expr(Expr::Path(p), None)]
                     if ctx.config.yew.use_prop_init_shorthand
@@ -594,6 +598,12 @@ impl Format for HtmlProp {
                     expr.format(block, ctx)
                 }
             },
+
+            HtmlPropKind::Style(name, eq, style) => {
+                block.add_source_punctuated(ctx, name)?;
+                block.add_source(ctx, eq)?;
+                style.format(block, ctx)
+            }
         }
     }
 }
@@ -615,8 +625,12 @@ impl Format for Block {
 impl Format for HtmlBlock {
     fn format<'src>(&self, block: &mut FmtBlock<'_, 'src>, ctx: &mut FmtCtx<'_, 'src>) -> Result {
         block.add_source(ctx, self.brace.span.open())?;
-        self.content.format_with_space(block, ctx)?;
-        block.add_source_with_space(ctx, self.brace.span.close())
+        let closing_brace_span = self.brace.span.close();
+        if let Some(content) = &self.content {
+            content.format_with_space(block, ctx)?;
+            block.add_space(ctx, closing_brace_span.start())?;
+        }
+        block.add_source(ctx, closing_brace_span)
     }
 }
 
@@ -794,7 +808,9 @@ impl Located for HtmlProp {
 
         match &self.kind {
             HtmlPropKind::Shortcut(brace, _) => brace.span.open().start(),
-            HtmlPropKind::Literal(name, ..) | HtmlPropKind::Block(name, ..) => unsafe {
+            HtmlPropKind::Literal(name, ..)
+            | HtmlPropKind::Block(name, ..)
+            | HtmlPropKind::Style(name, ..) => unsafe {
                 // Safety: the name of the prop is guaranteed to be non-empty by
                 // `Punctuated::parse_terminated(_nonempty)`
                 name.first().unwrap_unchecked().span().start()
@@ -805,8 +821,9 @@ impl Located for HtmlProp {
     fn end(&self) -> LineColumn {
         match &self.kind {
             HtmlPropKind::Shortcut(brace, _) => brace.span.close().end(),
-            HtmlPropKind::Literal(_, _, lit) => lit.span().end(),
-            HtmlPropKind::Block(_, _, expr) => expr.brace_token.span.close().end(),
+            HtmlPropKind::Literal(.., lit) => lit.span().end(),
+            HtmlPropKind::Block(.., expr) => expr.brace_token.span.close().end(),
+            HtmlPropKind::Style(.., style) => style.end(),
         }
     }
 }
