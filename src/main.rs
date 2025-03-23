@@ -137,6 +137,7 @@ struct Cli {
 }
 
 pub fn main() -> anyhow::Result<ExitCode> {
+    eprintln!("{:?}", std::env::args());
     let args = Cli::parse();
     let color_choice = match args.color {
         ColorWhen::Auto => ColorChoice::Auto,
